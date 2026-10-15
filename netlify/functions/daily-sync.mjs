@@ -13,6 +13,44 @@ function tag(xml,name){const m=xml.match(new RegExp('<'+name+'(?:\\s[^>]*)?>([\\
 function parseRSS(xml,source){return [...xml.matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map(([,raw])=>{const title=tag(raw,'title'),url=tag(raw,'link'),date=new Date(tag(raw,'pubDate'));if(!title||!/^https:\/\//i.test(url)||Number.isNaN(date.getTime()))return null;if(!/wuthering waves|鳴潮/i.test(title)||!POSITIVE.test(title)||NEGATIVE.test(title))return null;const version=(title.match(/(?:version|v)\s*(\d+(?:\.\d+)?)/i)||[])[1]||'';return{id:`${source}:${url}`,title,category:category(title),version,published:date.toISOString(),source:`${source}（二手新聞搜尋）`,source_type:'secondary',verification:'unverified',url,summary_zh:null,title_zh:null}}).filter(Boolean)}
 async function fetchSource(source){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),12000);try{const r=await fetch(source.url,{signal:controller.signal,headers:{accept:'application/rss+xml, application/xml, text/xml'}});if(!r.ok)throw Error(`HTTP ${r.status}`);const xml=await r.text();if(!/<rss\b|<item\b/i.test(xml))throw Error('Invalid RSS');return parseRSS(xml,source.name)}finally{clearTimeout(timeout)}}
 function dedupeKey(item){return item.title.toLowerCase().replace(/\s+-\s+[^-]+$/,'').replace(/[^\p{L}\p{N}]+/gu,' ').trim().slice(0,160)}
-async function translate(text){const key=process.env.GOOGLE_TRANSLATE_API_KEY;if(!key)return null;const r=await fetch(`https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(key)}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({q:text,target:'zh-TW',format:'text'})});if(!r.ok)throw Error(`Translation HTTP ${r.status}`);return decode((await r.json()).data?.translations?.[0]?.translatedText||'')||null}
-export default async()=>{const results=await Promise.allSettled(SOURCES.map(fetchSource));let fresh=[],succeeded=0;results.forEach((r,i)=>{if(r.status==='fulfilled'){succeeded++;fresh.push(...r.value);console.log(`${SOURCES[i].name}: ${r.value.length} filtered articles`)}else console.warn(`${SOURCES[i].name}: ${r.reason?.message||r.reason}`)});if(!succeeded){console.error('All feeds failed; old data retained');return}const store=getStore('wuwa-tracker'),old=await store.get('latest',{type:'json'}).catch(()=>null);const cutoff=Date.now()-45*86400000;const prior=(old?.items||[]).filter(x=>Date.parse(x.published)>=cutoff&&POSITIVE.test(x.title||'')&&!NEGATIVE.test(x.title||''));const unique=new Map();for(const item of [...fresh,...prior]){if(Date.parse(item.published)<cutoff)continue;const k=dedupeKey(item);if(!unique.has(k))unique.set(k,item)}const items=[...unique.values()].sort((a,b)=>Date.parse(b.published)-Date.parse(a.published)).slice(0,100);let translated=0;if(process.env.GOOGLE_TRANSLATE_API_KEY){for(const item of items.slice(0,30)){if(item.title_zh)continue;try{item.title_zh=await translate(item.title);if(item.title_zh)translated++}catch(e){console.warn('Translation unavailable:',e.message);break}}}await store.setJSON('latest',{updated_at:new Date().toISOString(),items});console.log(`Saved ${items.length} filtered articles; translated ${translated}; RSS sources available ${succeeded}/${SOURCES.length}`)};
+// Free MyMemory public translation endpoint; no credential or billing required.
+// Translation is best-effort, and source titles are always retained.
+const MAX_TRANSLATIONS_PER_RUN=10;
+async function translate(text){
+  if(!text || Buffer.byteLength(text,'utf8')>480)return null;
+  const url=new URL('https://api.mymemory.translated.net/get');
+  url.searchParams.set('q',text);
+  url.searchParams.set('langpair','en|zh-TW');
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),6000);
+  try{
+    const r=await fetch(url,{signal:controller.signal,headers:{accept:'application/json'}});
+    if(!r.ok)throw Error(`MyMemory HTTP ${r.status}`);
+    const data=await r.json();
+    if(Number(data.responseStatus)!==200)throw Error(`MyMemory response ${data.responseStatus}`);
+    const result=decode(String(data.responseData?.translatedText||''));
+    if(!result || /MYMEMORY WARNING|QUERY LENGTH LIMIT|INVALID LANGUAGE/i.test(result))return null;
+    return result===text?null:result;
+  }finally{clearTimeout(timeout)}
+}
+export default async()=>{const results=await Promise.allSettled(SOURCES.map(fetchSource));let fresh=[],succeeded=0;results.forEach((r,i)=>{if(r.status==='fulfilled'){succeeded++;fresh.push(...r.value);console.log(`${SOURCES[i].name}: ${r.value.length} filtered articles`)}else console.warn(`${SOURCES[i].name}: ${r.reason?.message||r.reason}`)});if(!succeeded){console.error('All feeds failed; old data retained');return}const store=getStore('wuwa-tracker'),old=await store.get('latest',{type:'json'}).catch(()=>null);const cutoff=Date.now()-45*86400000;const prior=(old?.items||[]).filter(x=>Date.parse(x.published)>=cutoff&&POSITIVE.test(x.title||'')&&!NEGATIVE.test(x.title||''));const unique=new Map();for(const item of [...fresh,...prior]){if(Date.parse(item.published)<cutoff)continue;const k=dedupeKey(item);if(!unique.has(k))unique.set(k,item)}const items=[...unique.values()].sort((a,b)=>Date.parse(b.published)-Date.parse(a.published)).slice(0,100);let translated=0,attempted=0;
+// Cache translations from previous runs, including same titles with changed source URLs.
+const previousTranslations=new Map((old?.items||[]).filter(x=>x.title_zh).map(x=>[dedupeKey(x),x.title_zh]));
+for(const item of items){
+  if(!item.title_zh && previousTranslations.has(dedupeKey(item)))item.title_zh=previousTranslations.get(dedupeKey(item));
+}
+for(const item of items){
+  if(attempted>=MAX_TRANSLATIONS_PER_RUN)break;
+  if(item.title_zh)continue;
+  attempted++;
+  try{
+    const value=await translate(item.title);
+    if(value){item.title_zh=value;translated++}
+  }catch(e){
+    console.warn('Free translation unavailable:',e.message);
+    // Stop on failures instead of repeatedly requesting a limited public service.
+    break;
+  }
+}
+await store.setJSON('latest',{updated_at:new Date().toISOString(),items});console.log(`Saved ${items.length} filtered articles; translated ${translated}; free translations ${translated}/${attempted}; RSS sources available ${succeeded}/${SOURCES.length}`)};
 export const config={schedule:'0 0 * * *'};
