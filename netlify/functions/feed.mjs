@@ -1,0 +1,2 @@
+import { getStore } from '@netlify/blobs';
+export default async () => {try{const store=getStore('wuwa-tracker');const data=await store.get('latest',{type:'json'});return new Response(JSON.stringify(data||{updated_at:null,items:[]}),{headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}})}catch(e){return new Response(JSON.stringify({error:'儲存空間尚未設定',items:[]}),{status:503,headers:{'content-type':'application/json'}})}};
